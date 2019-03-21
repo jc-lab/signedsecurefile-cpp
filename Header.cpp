@@ -346,7 +346,7 @@ namespace signedsecurefile {
 						int secretLen;
 						const unsigned char *pReadedSignature;
 						const EC_POINT *ecPubkeyPoint = EC_KEY_get0_public_key(pubKey);
-						unsigned char secureHeaderHash[20] = {0};
+						unsigned char secureHeaderHash[32] = {0};
 						int signedSecureHeaderPos = 3 + ecKeySize + signatureSize;
 						AES_KEY headerKey;
 						unsigned char iv[16];
@@ -390,7 +390,7 @@ namespace signedsecurefile {
 
 						pReadedSignature = &signedSecureHeader[3 + ecKeySize];
 						ecsig = d2i_ECDSA_SIG(NULL, &pReadedSignature, signatureSize);
-						SHA1((const unsigned char*)&secureHeader, sizeof(secureHeader), secureHeaderHash);
+						SHA256((const unsigned char*)&secureHeader, sizeof(secureHeader), secureHeaderHash);
 						orc = ECDSA_do_verify(secureHeaderHash, sizeof(secureHeaderHash), ecsig, pubKey);
 						if (orc != 1)
 						{
@@ -483,7 +483,7 @@ namespace signedsecurefile {
 				unsigned char sharedKey[32];
 				unsigned char iv[16];
 				int secretLen = (EC_GROUP_get_degree(EC_KEY_get0_group(priKey)) + 7) / 8;
-				unsigned char secureHeaderHash[20] = { 0 };
+				unsigned char secureHeaderHash[32] = { 0 };
 				int ecSigSize = ECDSA_size(signEcKey);
 				unsigned int ecSigLen = 0;
 				unsigned char encBuffer[32];
@@ -492,7 +492,7 @@ namespace signedsecurefile {
 				unsigned int encDataRemaining = sizeof(secureHeader);
 
 				memcpy(iv, DATA_IV, sizeof(DATA_IV));
-				SHA1((const unsigned char*)&secureHeader, sizeof(secureHeader), secureHeaderHash);
+				SHA256((const unsigned char*)&secureHeader, sizeof(secureHeader), secureHeaderHash);
 				if (secretLen > sizeof(tempSecretKeyBuf))
 				{
 					pTempSecretKey = tempSecretKeyMem = (unsigned char *)getMemoryAllocator()->allocate(secretLen);
