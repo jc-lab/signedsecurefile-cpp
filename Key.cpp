@@ -44,6 +44,11 @@ namespace signedsecurefile {
 				RSA_free(this->rsa);
 				this->rsa = NULL;
 			}
+			if (this->ec)
+			{
+				EC_KEY_free(this->ec);
+				this->ec = NULL;
+			}
 		}
 	}
 
