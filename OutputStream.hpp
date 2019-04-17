@@ -25,7 +25,7 @@ namespace signedsecurefile {
 	{
 	private:
 #if defined(HAS_OPENSSL) && HAS_OPENSSL
-		HMAC_CTX dataHmacCtx;
+		HMAC_CTX *dataHmacCtx;
 		EVP_CIPHER_CTX *dataEvpCtx;
 #endif
 

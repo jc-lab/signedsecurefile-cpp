@@ -20,14 +20,13 @@ namespace signedsecurefile {
 		this->header.generateKey();
 		this->header.setDataCipherAlgorithm(DataCipherAlgorithm::AES);
 #if defined(HAS_OPENSSL) && HAS_OPENSSL
-		HMAC_CTX dataKeyHmacCtx;
-
-		HMAC_CTX_init(&dataKeyHmacCtx);
-		HMAC_CTX_init(&dataHmacCtx);
-		HMAC_Init_ex(&dataKeyHmacCtx, secretKey.c_str(), secretKey.length(), EVP_sha256(), NULL);
-		HMAC_Init_ex(&dataHmacCtx, secretKey.c_str(), secretKey.length(), EVP_sha256(), NULL);
-		HMAC_Update(&dataKeyHmacCtx, this->header.secureHeader.key, sizeof(this->header.secureHeader.key));
-		HMAC_Final(&dataKeyHmacCtx, dataKey, &dataKeyLen);
+		HMAC_CTX *dataKeyHmacCtx = HMAC_CTX_new();
+		dataHmacCtx = HMAC_CTX_new();
+		HMAC_Init_ex(dataKeyHmacCtx, secretKey.c_str(), secretKey.length(), EVP_sha256(), NULL);
+		HMAC_Init_ex(dataHmacCtx, secretKey.c_str(), secretKey.length(), EVP_sha256(), NULL);
+		HMAC_Update(dataKeyHmacCtx, this->header.secureHeader.key, sizeof(this->header.secureHeader.key));
+		HMAC_Final(dataKeyHmacCtx, dataKey, &dataKeyLen);
+		HMAC_CTX_free(dataKeyHmacCtx);
 		dataEvpCtx = EVP_CIPHER_CTX_new();
 		EVP_CipherInit_ex(dataEvpCtx, EVP_aes_256_cbc(), NULL, dataKey, Header::DATA_IV, 1);
 #endif
@@ -38,7 +37,8 @@ namespace signedsecurefile {
 	OutputStream::~OutputStream()
 	{
 #if defined(HAS_OPENSSL) && HAS_OPENSSL
-		HMAC_CTX_cleanup(&dataHmacCtx);
+		if(dataHmacCtx)
+			HMAC_CTX_free(dataHmacCtx);
 		if (dataEvpCtx)
 			EVP_CIPHER_CTX_free(dataEvpCtx);
 #endif
@@ -49,7 +49,7 @@ namespace signedsecurefile {
 		const unsigned char *writePtr = buffer;
 		size_t remaining = size;
 		int outLen;
-		HMAC_Update(&dataHmacCtx, buffer, size);
+		HMAC_Update(dataHmacCtx, buffer, size);
 		this->header.secureHeader.datasize += size;
 		do {
 			int rc;
@@ -85,7 +85,7 @@ namespace signedsecurefile {
 			if (outLen > 0)
 				this->buffer.write(out, outLen);
 		}
-		HMAC_Final(&dataHmacCtx, hmac, &hmacLen);
+		HMAC_Final(dataHmacCtx, hmac, &hmacLen);
 		memcpy(header.secureHeader.hmac, hmac, hmacLen);
 		if (header.writeTo(this->buffer, this->computedHeaderSize, exception))
 		{
