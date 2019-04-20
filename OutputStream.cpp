@@ -53,8 +53,8 @@ namespace signedsecurefile {
 		this->header.secureHeader.datasize += size;
 		do {
 			int rc;
-			unsigned char out[256];
-			unsigned int writtenSize = remaining > sizeof(out) ? sizeof(out) : remaining;
+			unsigned char out[256 + 32];
+			unsigned int writtenSize = remaining > 256 ? 256 : remaining;
 			outLen = 0;
 			rc = EVP_CipherUpdate(dataEvpCtx, out, &outLen, writePtr, writtenSize);
 			if (rc <= 0)

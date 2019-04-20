@@ -44,7 +44,7 @@ namespace signedsecurefile {
 	int InputStream::input(const unsigned char *payload, size_t size, exception::SignedSecureFileException *exception)
 	{
 		int rc;
-		unsigned char decryptDataBuffer[128];
+		unsigned char decryptDataBuffer[128 + 32];
 		if (!headerReaded)
 		{
 			buffer.write(payload, size);
@@ -77,7 +77,7 @@ namespace signedsecurefile {
 					size_t remaining = datasize;
 					int outlen;
 					do {
-						unsigned int writtenSize = remaining > sizeof(decryptDataBuffer) ? sizeof(decryptDataBuffer) : remaining;
+						unsigned int writtenSize = remaining > 128 ? 128 : remaining;
 						const unsigned char *ptr = buffer.readBuffer(writtenSize);
 						outlen = 0;
 						orc = EVP_CipherUpdate(dataEvpCtx, decryptDataBuffer, &outlen, ptr, writtenSize);
@@ -100,10 +100,10 @@ namespace signedsecurefile {
 			int outlen;
 			size_t remaining = size;
 			do {
-				unsigned int writtenSize = remaining > sizeof(decryptDataBuffer) ? sizeof(decryptDataBuffer) : remaining;
+				unsigned int writtenSize = remaining > 128 ? 128 : remaining;
 				const unsigned char *ptr = payload;
 				int rc;
-				outlen = sizeof(decryptDataBuffer);
+				outlen = 0;
 				rc = EVP_CipherUpdate(dataEvpCtx, decryptDataBuffer, &outlen, ptr, writtenSize);
 				if (rc <= 0) {
 					break;
