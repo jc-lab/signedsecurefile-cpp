@@ -21,10 +21,10 @@ namespace signedsecurefile {
 	{
 		this->useCppThrow = false;
 #if defined(HAS_OPENSSL) && HAS_OPENSSL
-		HMAC_CTX_init(&dataHmacCtx);
-		HMAC_CTX_init(&dataKeyHmacCtx);
-		HMAC_Init_ex(&dataHmacCtx, secretKey.c_str(), secretKey.length(), EVP_sha256(), NULL);
-		HMAC_Init_ex(&dataKeyHmacCtx, secretKey.c_str(), secretKey.length(), EVP_sha256(), NULL);
+		dataHmacCtx = HMAC_CTX_new();
+		dataKeyHmacCtx = HMAC_CTX_new();
+		HMAC_Init_ex(dataHmacCtx, secretKey.c_str(), secretKey.length(), EVP_sha256(), NULL);
+		HMAC_Init_ex(dataKeyHmacCtx, secretKey.c_str(), secretKey.length(), EVP_sha256(), NULL);
 		dataEvpCtx = NULL;
 #endif
 		this->headerReaded = false;
@@ -34,8 +34,10 @@ namespace signedsecurefile {
 	InputStream::~InputStream()
 	{
 #if defined(HAS_OPENSSL) && HAS_OPENSSL
-		HMAC_CTX_cleanup(&dataHmacCtx);
-		HMAC_CTX_cleanup(&dataKeyHmacCtx);
+		if(dataHmacCtx)
+			HMAC_CTX_free(dataHmacCtx);
+		if(dataKeyHmacCtx)
+			HMAC_CTX_free(dataKeyHmacCtx);
 		if (dataEvpCtx)
 			EVP_CIPHER_CTX_free(dataEvpCtx);
 #endif
@@ -60,9 +62,9 @@ namespace signedsecurefile {
 				DataCipherAlgorithm dataCipherAlgo = header.getDataCipherAlgorithm();
 				dataEvpCtx = EVP_CIPHER_CTX_new();
 
-				HMAC_Update(&dataKeyHmacCtx, header.secureHeader.key, sizeof(header.secureHeader.key));
-				HMAC_Final(&dataKeyHmacCtx, dateKey, &dataKeyLen);
-				HMAC_CTX_cleanup(&dataKeyHmacCtx);
+				HMAC_Update(dataKeyHmacCtx, header.secureHeader.key, sizeof(header.secureHeader.key));
+				HMAC_Final(dataKeyHmacCtx, dateKey, &dataKeyLen);
+				HMAC_CTX_reset(dataKeyHmacCtx);
 
 				if (dataCipherAlgo == DataCipherAlgorithm::AES) {
 					EVP_CipherInit_ex(dataEvpCtx, EVP_aes_256_cbc(), NULL, NULL, NULL, 0);
@@ -86,7 +88,7 @@ namespace signedsecurefile {
 						}
 						if (outlen > 0) {
 							decryptedDataBuffer.write(decryptDataBuffer, outlen);
-							HMAC_Update(&dataHmacCtx, decryptDataBuffer, outlen);
+							HMAC_Update(dataHmacCtx, decryptDataBuffer, outlen);
 						}
 						remaining -= writtenSize;
 						datasize = 0;
@@ -110,7 +112,7 @@ namespace signedsecurefile {
 				}
 				if (outlen > 0) {
 					decryptedDataBuffer.write(decryptDataBuffer, outlen);
-					HMAC_Update(&dataHmacCtx, decryptDataBuffer, outlen);
+					HMAC_Update(dataHmacCtx, decryptDataBuffer, outlen);
 				}
 				payload += writtenSize;
 				remaining = writtenSize;
@@ -149,10 +151,10 @@ namespace signedsecurefile {
 			}
 			if (outlen > 0) {
 				decryptedDataBuffer.write(decryptDataBuffer, outlen);
-				HMAC_Update(&dataHmacCtx, decryptDataBuffer, outlen);
+				HMAC_Update(dataHmacCtx, decryptDataBuffer, outlen);
 			}
 		}
-		HMAC_Final(&dataHmacCtx, computedHmac, &hmacLen);
+		HMAC_Final(dataHmacCtx, computedHmac, &hmacLen);
 
 		if (decryptedDataBuffer.position() < header.secureHeader.datasize)
 		{
