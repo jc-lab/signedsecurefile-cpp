@@ -13,7 +13,9 @@
 #include "exception/InvalidKeyException.hpp"
 #include "exception/IntegrityException.hpp"
 
-#ifdef HAS_OPENSSL
+#include <vector>
+
+#if defined(HAS_OPENSSL) && HAS_OPENSSL
 #include <openssl/rsa.h>
 #include <openssl/ec.h>
 #include <openssl/ecdh.h>
@@ -24,6 +26,17 @@
 #include <openssl/x509.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+#endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+#include <assert.h>
+#include <mbedtls/md.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/ecdsa.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/ecdh.h>
+#include <mbedtls/asn1.h>
 #endif
 
 namespace signedsecurefile {
@@ -71,6 +84,11 @@ namespace signedsecurefile {
 #endif
 		ecSignedSecureHeader = NULL;
 		initHeader();
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+		mbedtls_entropy_init(&entropy_ctx);
+		mbedtls_ctr_drbg_init(&ctr_drbg_ctx);
+		mbedtls_ctr_drbg_seed(&ctr_drbg_ctx, mbedtls_entropy_func, &entropy_ctx, NULL, 0);
+#endif
 	}
 
 	Header::Header()
@@ -96,10 +114,59 @@ namespace signedsecurefile {
 		{
 			getMemoryAllocator()->release(ecSignedSecureHeader);
 		}
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+		mbedtls_ctr_drbg_free(&ctr_drbg_ctx);
+		mbedtls_entropy_free(&entropy_ctx);
+#endif
 	}
+
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+	static int mbedtls_raw2bn(mbedtls_mpi *x, const unsigned char *data, size_t size)
+	{
+		if (data[0] >= 0x80)
+		{
+			std::string temp(1, 0x00);
+			temp.append((const char*)data, size);
+			return mbedtls_mpi_read_binary(x, (const unsigned char*)temp.data(), temp.size());
+		}
+		return mbedtls_mpi_read_binary(x, data, size);
+	}
+
+	static void mbedtls_SHA256(const unsigned char *d, size_t n, unsigned char *md)
+	{
+		mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), d, n, md);
+	}
+
+	static int mbedtls_read_ecdsa_signature(const unsigned char *begin, const unsigned char *end, mbedtls_mpi *r, mbedtls_mpi *s)
+	{
+		int ret;
+		size_t len;
+		unsigned char *p = (unsigned char*)begin;
+
+		if ((ret = mbedtls_asn1_get_tag(&p, end, &len,
+			MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE)) != 0)
+			return(MBEDTLS_ERR_PK_INVALID_PUBKEY + ret);
+
+		if (p + len != end)
+			return(MBEDTLS_ERR_PK_INVALID_PUBKEY +
+				MBEDTLS_ERR_ASN1_LENGTH_MISMATCH);
+
+		if ((ret = mbedtls_asn1_get_mpi(&p, end, r)) != 0 ||
+			(ret = mbedtls_asn1_get_mpi(&p, end, s)) != 0)
+			return(MBEDTLS_ERR_PK_INVALID_PUBKEY + ret);
+
+		if (p != end)
+			return(MBEDTLS_ERR_PK_INVALID_PUBKEY +
+				MBEDTLS_ERR_ASN1_LENGTH_MISMATCH);
+
+		return(0);
+	}
+
+#endif
 
 	void Header::setAsymKey(Key *key, bool encMode)
 	{
+		int librc;
 		this->asymKey = key;
 		if (ecSignedSecureHeader)
 		{
@@ -110,7 +177,16 @@ namespace signedsecurefile {
 			if (key->isRSAKey())
 			{
 				setHeaderCipherAlgorithm(HeaderCipherAlgorithm::RSA);
-				this->outputSignedSecureHeaderTotalSize = RSA_size(key->getOpensslRSAKey());
+#if defined(HAS_OPENSSL) && HAS_OPENSSL
+				if (key->isOpensslKey()) {
+					this->outputSignedSecureHeaderTotalSize = RSA_size(key->getOpensslRSAKey());
+				}
+#endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+				if (key->isMbedtlsKey()) {
+					this->outputSignedSecureHeaderTotalSize = mbedtls_rsa_get_len(key->getMbedtlsRSAKey());
+				}
+#endif
 			}
 			else if (key->isECKey())
 			{
@@ -118,70 +194,110 @@ namespace signedsecurefile {
 
 				if (encMode)
 				{
-					EC_KEY *ecKey = this->asymKey->getOpensslECKey();
-					int signatureSize = ECDSA_size(this->asymKey->getOpensslECKey());
-					unsigned char prefixHeader[3];
-					size_t encodedSecureHeaderSize = sizeof(secureHeader);
+#if defined(HAS_OPENSSL) && HAS_OPENSSL
+					if (key->isOpensslKey()) {
+						EC_KEY *ecKey = this->asymKey->getOpensslECKey();
+						int signatureSize = ECDSA_size(this->asymKey->getOpensslECKey());
+						unsigned char prefixHeader[3];
+						size_t encodedSecureHeaderSize = sizeof(secureHeader);
 
-					BIO *privateKeyBio = NULL;
-					EVP_PKEY *pkey = NULL;
-					PKCS8_PRIV_KEY_INFO *p8ki = NULL;
+						BIO *privateKeyBio = NULL;
+						EVP_PKEY *pkey = NULL;
+						PKCS8_PRIV_KEY_INFO *p8ki = NULL;
 
-					do {
-						BUF_MEM *bptr = NULL;
+						do {
+							BUF_MEM *bptr = NULL;
 
-						ecLocalPrivateKey = EC_KEY_new();
-						EC_KEY_set_group(ecLocalPrivateKey, EC_KEY_get0_group(ecKey));
-						EC_KEY_generate_key(ecLocalPrivateKey);
+							ecLocalPrivateKey = EC_KEY_new();
+							EC_KEY_set_group(ecLocalPrivateKey, EC_KEY_get0_group(ecKey));
+							EC_KEY_generate_key(ecLocalPrivateKey);
 
-						privateKeyBio = BIO_new(BIO_s_mem());
-						if (!privateKeyBio)
-						{
-							break;
+							privateKeyBio = BIO_new(BIO_s_mem());
+							if (!privateKeyBio)
+							{
+								break;
+							}
+
+							EVP_PKEY *pkey = EVP_PKEY_new();
+							if (!pkey)
+							{
+								break;
+							}
+							EVP_PKEY_set1_EC_KEY(pkey, ecLocalPrivateKey);
+							PKCS8_PRIV_KEY_INFO *p8ki = EVP_PKEY2PKCS8(pkey);
+							if (!p8ki)
+							{
+								break;
+							}
+							if (i2d_PKCS8_PRIV_KEY_INFO_bio(privateKeyBio, p8ki) <= 0)
+							{
+								break;
+							}
+
+							BIO_get_mem_ptr(privateKeyBio, &bptr);
+
+							ecSignedSecureHeader = (ECSignedSecureHeader_t*)getMemoryAllocator()->allocate(3 + bptr->length + signatureSize);
+							ecSignedSecureHeader->privKeySize = bptr->length;
+							ecSignedSecureHeader->sigSize = signatureSize;
+							memcpy(ecSignedSecureHeader->privKey, bptr->data, bptr->length);
+							outputSignedSecureHeaderTotalSize = 3 + ecSignedSecureHeader->privKeySize + ecSignedSecureHeader->sigSize;
+						} while (0);
+
+						if (p8ki) {
+							PKCS8_PRIV_KEY_INFO_free(p8ki);
+						}
+						if (pkey) {
+							EVP_PKEY_free(pkey);
+						}
+						if (privateKeyBio) {
+							BIO_free_all(privateKeyBio);
 						}
 
-						EVP_PKEY *pkey = EVP_PKEY_new();
-						if (!pkey)
+						encodedSecureHeaderSize += 1;
+						if (encodedSecureHeaderSize % 16)
 						{
-							break;
+							encodedSecureHeaderSize += 16 - (encodedSecureHeaderSize % 16);
 						}
-						EVP_PKEY_set1_EC_KEY(pkey, ecLocalPrivateKey);
-						PKCS8_PRIV_KEY_INFO *p8ki = EVP_PKEY2PKCS8(pkey);
-						if (!p8ki)
-						{
-							break;
-						}
-						if (i2d_PKCS8_PRIV_KEY_INFO_bio(privateKeyBio, p8ki) <= 0)
-						{
-							break;
-						}
+						this->outputSignedSecureHeaderDataSize = encodedSecureHeaderSize;
+						this->outputSignedSecureHeaderTotalSize += encodedSecureHeaderSize;
+					}
+#endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+					if (key->isMbedtlsKey()) {
+						assert("NOT SUPPORT YET" == false);
+						const mbedtls_ecp_keypair *ecKey = this->asymKey->getMbedtlsECKey();
+						int signatureSize = MBEDTLS_ECDSA_MAX_LEN;
+						unsigned char prefixHeader[3];
+						size_t encodedSecureHeaderSize = sizeof(secureHeader);
+						mbedtls_pk_context newKeyPk;
+						size_t plen;
+						std::vector<unsigned char> tempBuffer;
 
-						BIO_get_mem_ptr(privateKeyBio, &bptr);
+						mbedtls_pk_init(&newKeyPk);
+						mbedtls_pk_setup(&newKeyPk, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
+						mbedtls_ecp_gen_key(ecKey->grp.id, mbedtls_pk_ec(newKeyPk), mbedtls_ctr_drbg_random, &ctr_drbg_ctx);
+						plen = mbedtls_pk_get_len(&newKeyPk);
 
-						ecSignedSecureHeader = (ECSignedSecureHeader_t*)getMemoryAllocator()->allocate(3 + bptr->length + signatureSize);
-						ecSignedSecureHeader->privKeySize = bptr->length;
+						do {
+							tempBuffer.resize(tempBuffer.size() + 1024);
+							librc = mbedtls_pk_write_key_der(&newKeyPk, &tempBuffer[0], tempBuffer.capacity());
+						} while (librc == MBEDTLS_ERR_ASN1_BUF_TOO_SMALL);
+
+						ecSignedSecureHeader = (ECSignedSecureHeader_t*)getMemoryAllocator()->allocate(3 + librc + signatureSize);
+						ecSignedSecureHeader->privKeySize = librc;
 						ecSignedSecureHeader->sigSize = signatureSize;
-						memcpy(ecSignedSecureHeader->privKey, bptr->data, bptr->length);
-						outputSignedSecureHeaderTotalSize = 3 + ecSignedSecureHeader->privKeySize + ecSignedSecureHeader->sigSize;
-					} while (0);
+						outputSignedSecureHeaderTotalSize = 3 + librc + ecSignedSecureHeader->sigSize;
+						memcpy(ecSignedSecureHeader->privKey, &tempBuffer[0], librc);
 
-					if (p8ki) {
-						PKCS8_PRIV_KEY_INFO_free(p8ki);
+						encodedSecureHeaderSize += 1;
+						if (encodedSecureHeaderSize % 16)
+						{
+							encodedSecureHeaderSize += 16 - (encodedSecureHeaderSize % 16);
+						}
+						this->outputSignedSecureHeaderDataSize = encodedSecureHeaderSize;
+						this->outputSignedSecureHeaderTotalSize += encodedSecureHeaderSize;
 					}
-					if (pkey) {
-						EVP_PKEY_free(pkey);
-					}
-					if (privateKeyBio) {
-						BIO_free_all(privateKeyBio);
-					}
-
-					encodedSecureHeaderSize += 1;
-					if (encodedSecureHeaderSize % 16)
-					{
-						encodedSecureHeaderSize += 16 - (encodedSecureHeaderSize % 16);
-					}
-					this->outputSignedSecureHeaderDataSize = encodedSecureHeaderSize;
-					this->outputSignedSecureHeaderTotalSize += encodedSecureHeaderSize;
+#endif
 				}
 			}
 		}
@@ -263,15 +379,30 @@ namespace signedsecurefile {
 	int Header::getSignedSecureHeaderSize()
 	{
 #if defined(HAS_OPENSSL) && HAS_OPENSSL
-		if (headerCipherAlgorithm == HeaderCipherAlgorithm::RSA)
-		{
-			return RSA_size(this->asymKey->getOpensslRSAKey());
-		}else if (headerCipherAlgorithm == HeaderCipherAlgorithm::EC)
-		{
-			return this->outputSignedSecureHeaderTotalSize;
+		if (asymKey->isOpensslKey()) {
+			if (headerCipherAlgorithm == HeaderCipherAlgorithm::RSA)
+			{
+				return RSA_size(this->asymKey->getOpensslRSAKey());
+			}
+			else if (headerCipherAlgorithm == HeaderCipherAlgorithm::EC)
+			{
+				return this->outputSignedSecureHeaderTotalSize;
+			}
 		}
-		return -1;
 #endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+		if (asymKey->isMbedtlsKey()) {
+			if (headerCipherAlgorithm == HeaderCipherAlgorithm::RSA)
+			{
+				return mbedtls_rsa_get_len(this->asymKey->getMbedtlsRSAKey());
+			}
+			else if (headerCipherAlgorithm == HeaderCipherAlgorithm::EC)
+			{
+				return this->outputSignedSecureHeaderTotalSize;
+			}
+		}
+#endif
+		return -1;
 	}
 
 	int Header::readBuffer(Buffer &buffer, exception::SignedSecureFileException *exception)
@@ -330,89 +461,185 @@ namespace signedsecurefile {
 				unsigned char *tempSecretKey = NULL;
 				unsigned char *decodedSecureHeader = NULL;
 				unsigned char sharedKey[32];
+#if defined(HAS_OPENSSL) && HAS_OPENSSL
 				EC_KEY *ecPrivateKey = NULL;
 				EC_GROUP *ecPrivateGroup = NULL;
 				ECDSA_SIG *ecsig = NULL;
+#endif
 				int orc;
 				buffer.read(signedSecureHeader, rawHeader.signedSecureHeaderSize);
 				do {
-#if defined(HAS_OPENSSL) && HAS_OPENSSL
 					if (this->headerCipherAlgorithm == HeaderCipherAlgorithm::EC)
 					{
 						uint16_t ecKeySize = (((uint16_t)signedSecureHeader[0]) << 0) | ((uint16_t)signedSecureHeader[1]) << 8;
 						uint8_t signatureSize = signedSecureHeader[2];
 						const unsigned char *pEcKey = &signedSecureHeader[3];
-						EC_KEY *pubKey = asymKey->getOpensslECKey();
 						int secretLen;
 						const unsigned char *pReadedSignature;
-						const EC_POINT *ecPubkeyPoint = EC_KEY_get0_public_key(pubKey);
-						unsigned char secureHeaderHash[32] = {0};
+						unsigned char secureHeaderHash[32] = { 0 };
 						int signedSecureHeaderPos = 3 + ecKeySize + signatureSize;
-						AES_KEY headerKey;
 						unsigned char iv[16];
+
 						memcpy(iv, DATA_IV, sizeof(DATA_IV));
 
-						BIO *privateKeyBio = BIO_new_mem_buf(pEcKey, ecKeySize);
-						if (privateKeyBio) {
-							PKCS8_PRIV_KEY_INFO *p8ki = d2i_PKCS8_PRIV_KEY_INFO_bio(privateKeyBio, NULL);
-							if (p8ki)
-							{
-								EVP_PKEY *pkey = EVP_PKCS82PKEY(p8ki);
-								if (pkey)
+#if defined(HAS_OPENSSL) && HAS_OPENSSL
+						if (asymKey->isOpensslKey()) {
+							AES_KEY headerKey;
+							EC_KEY *pubKey = asymKey->getOpensslECKey();
+							const EC_POINT *ecPubkeyPoint = EC_KEY_get0_public_key(pubKey);
+
+							BIO *privateKeyBio = BIO_new_mem_buf(pEcKey, ecKeySize);
+							if (privateKeyBio) {
+								PKCS8_PRIV_KEY_INFO *p8ki = d2i_PKCS8_PRIV_KEY_INFO_bio(privateKeyBio, NULL);
+								if (p8ki)
 								{
-									ecPrivateKey = EVP_PKEY_get1_EC_KEY(pkey);
+									EVP_PKEY *pkey = EVP_PKCS82PKEY(p8ki);
+									if (pkey)
+									{
+										ecPrivateKey = EVP_PKEY_get1_EC_KEY(pkey);
 
-									secretLen = EC_GROUP_get_degree(EC_KEY_get0_group(ecPrivateKey));
-									secretLen = (secretLen + 7) / 8;
-									tempSecretKey = (unsigned char*)malloc(secretLen);
-									secretLen = ECDH_compute_key(tempSecretKey, secretLen, ecPubkeyPoint, ecPrivateKey, NULL);
+										secretLen = EC_GROUP_get_degree(EC_KEY_get0_group(ecPrivateKey));
+										secretLen = (secretLen + 7) / 8;
+										tempSecretKey = (unsigned char*)malloc(secretLen);
+										secretLen = ECDH_compute_key(tempSecretKey, secretLen, ecPubkeyPoint, ecPrivateKey, NULL);
 
-									EVP_PKEY_free(pkey);
-								} else {
+										EVP_PKEY_free(pkey);
+									}
+									else {
+										break;
+									}
+									PKCS8_PRIV_KEY_INFO_free(p8ki);
+								}
+								else {
 									break;
 								}
-								PKCS8_PRIV_KEY_INFO_free(p8ki);
-							} else {
+								BIO_free(privateKeyBio);
+							}
+							else {
 								break;
 							}
-							BIO_free(privateKeyBio);
-						} else {
-							break;
+
+							SHA256(tempSecretKey, secretLen, sharedKey);
+							AES_set_decrypt_key(sharedKey, 256, &headerKey);
+
+							decodedSecureHeader = (unsigned char*)getMemoryAllocator()->allocate(rawHeader.signedSecureHeaderSize - signedSecureHeaderPos);
+							memset(decodedSecureHeader, 0, rawHeader.signedSecureHeaderSize - signedSecureHeaderPos);
+							AES_cbc_encrypt(&signedSecureHeader[signedSecureHeaderPos], decodedSecureHeader, rawHeader.signedSecureHeaderSize - signedSecureHeaderPos, &headerKey, iv, AES_DECRYPT);
+							memcpy(&secureHeader, decodedSecureHeader, sizeof(secureHeader));
+
+							pReadedSignature = &signedSecureHeader[3 + ecKeySize];
+							ecsig = d2i_ECDSA_SIG(NULL, &pReadedSignature, signatureSize);
+							SHA256((const unsigned char*)&secureHeader, sizeof(secureHeader), secureHeaderHash);
+							orc = ECDSA_do_verify(secureHeaderHash, sizeof(secureHeaderHash), ecsig, pubKey);
+							if (orc != 1)
+							{
+								causedException = exception::IntegrityException();
+								break;
+							}
 						}
+#endif
 
-						SHA256(tempSecretKey, secretLen, sharedKey);
-						AES_set_decrypt_key(sharedKey, 256, &headerKey);
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+						if (asymKey->isMbedtlsKey()) {
+							const mbedtls_ecp_keypair *mkey = asymKey->getMbedtlsECKey();
 
-						decodedSecureHeader = (unsigned char*)getMemoryAllocator()->allocate(rawHeader.signedSecureHeaderSize - signedSecureHeaderPos);
-						memset(decodedSecureHeader, 0, rawHeader.signedSecureHeaderSize - signedSecureHeaderPos);
-						AES_cbc_encrypt(&signedSecureHeader[signedSecureHeaderPos], decodedSecureHeader, rawHeader.signedSecureHeaderSize - signedSecureHeaderPos, &headerKey, iv, AES_DECRYPT);
-						memcpy(&secureHeader, decodedSecureHeader, sizeof(secureHeader));
+							size_t molen = 0;
 
-						pReadedSignature = &signedSecureHeader[3 + ecKeySize];
-						ecsig = d2i_ECDSA_SIG(NULL, &pReadedSignature, signatureSize);
-						SHA256((const unsigned char*)&secureHeader, sizeof(secureHeader), secureHeaderHash);
-						orc = ECDSA_do_verify(secureHeaderHash, sizeof(secureHeaderHash), ecsig, pubKey);
-						if (orc != 1)
-						{
-							causedException = exception::IntegrityException();
-							break;
+							{
+								mbedtls_pk_context pk_ctx;
+								mbedtls_pk_init(&pk_ctx);
+								orc = mbedtls_pk_parse_key(&pk_ctx, pEcKey, ecKeySize, NULL, 0);
+								if (orc == 0)
+								{
+									const mbedtls_ecp_keypair *mprikey = mbedtls_pk_ec(pk_ctx);
+									mbedtls_mpi z;
+									mbedtls_mpi_init(&z);
+									orc = mbedtls_ecdh_compute_shared((mbedtls_ecp_group*)&mkey->grp, &z, &mkey->Q, &mprikey->d, mbedtls_ctr_drbg_random, &ctr_drbg_ctx);
+									if (orc == 0)
+									{
+										secretLen = mbedtls_mpi_size(&z);
+										tempSecretKey = (unsigned char*)malloc(secretLen);
+										mbedtls_mpi_write_binary(&z, tempSecretKey, secretLen);
+									}
+									mbedtls_mpi_free(&z);
+								}
+								mbedtls_pk_free(&pk_ctx);
+							}
+
+							mbedtls_SHA256(tempSecretKey, secretLen, sharedKey);
+
+							{
+								mbedtls_aes_context headerCipher;
+								mbedtls_aes_init(&headerCipher);
+								mbedtls_aes_setkey_dec(&headerCipher, sharedKey, 256);
+
+								decodedSecureHeader = (unsigned char*)getMemoryAllocator()->allocate(rawHeader.signedSecureHeaderSize - signedSecureHeaderPos);
+								memset(decodedSecureHeader, 0, rawHeader.signedSecureHeaderSize - signedSecureHeaderPos);
+								mbedtls_aes_crypt_cbc(&headerCipher, MBEDTLS_AES_DECRYPT, rawHeader.signedSecureHeaderSize - signedSecureHeaderPos, iv, &signedSecureHeader[signedSecureHeaderPos], decodedSecureHeader);
+								memcpy(&secureHeader, decodedSecureHeader, sizeof(secureHeader));
+								mbedtls_aes_free(&headerCipher);
+							}
+
+							pReadedSignature = &signedSecureHeader[3 + ecKeySize];
+
+							{
+								unsigned char *ppos = (unsigned char *)pReadedSignature;
+								mbedtls_mpi r;
+								mbedtls_mpi s;
+
+								mbedtls_mpi_init(&r);
+								mbedtls_mpi_init(&s);
+
+								mbedtls_read_ecdsa_signature(pReadedSignature, pReadedSignature + signatureSize, &r, &s);
+
+								mbedtls_SHA256((const unsigned char*)&secureHeader, sizeof(secureHeader), secureHeaderHash);
+								//orc = mbedtls_ecdsa_verify((mbedtls_ecp_group*)&mkey->grp, secureHeaderHash, sizeof(secureHeaderHash), &mkey->Q, &r, &s);
+								mbedtls_ecdsa_context ecdsa;
+								mbedtls_ecdsa_init(&ecdsa);
+								mbedtls_ecdsa_from_keypair(&ecdsa, mkey);
+								orc = mbedtls_ecdsa_read_signature(&ecdsa, secureHeaderHash, sizeof(secureHeaderHash), pReadedSignature, signatureSize);
+
+								mbedtls_mpi_free(&r);
+								mbedtls_mpi_free(&s);
+							}
+
+							if (orc != 0)
+							{
+								causedException = exception::IntegrityException();
+								break;
+							}
 						}
-					} else if (this->headerCipherAlgorithm == HeaderCipherAlgorithm::RSA) {
+#endif
+					}
+					else if (this->headerCipherAlgorithm == HeaderCipherAlgorithm::RSA) {
 						decodedSecureHeader = (unsigned char*)getMemoryAllocator()->allocate(rawHeader.signedSecureHeaderSize);
 						memset(decodedSecureHeader, 0xff, rawHeader.signedSecureHeaderSize);
-						orc = RSA_public_decrypt(rawHeader.signedSecureHeaderSize, signedSecureHeader, decodedSecureHeader, this->asymKey->getOpensslRSAKey(), RSA_PKCS1_PADDING);
-						if (orc < 0) {
-							causedException = exception::IntegrityException();
-							break;
+
+#if defined(HAS_OPENSSL) && HAS_OPENSSL
+						if (asymKey->isOpensslKey()) {
+							orc = RSA_public_decrypt(rawHeader.signedSecureHeaderSize, signedSecureHeader, decodedSecureHeader, this->asymKey->getOpensslRSAKey(), RSA_PKCS1_PADDING);
+							if (orc < 0) {
+								causedException = exception::IntegrityException();
+								break;
+							}
 						}
+#endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+						if (asymKey->isMbedtlsKey()) {
+							size_t molen = 0;
+							orc = mbedtls_rsa_pkcs1_decrypt((mbedtls_rsa_context*)asymKey->getMbedtlsRSAKey(), mbedtls_ctr_drbg_random, &ctr_drbg_ctx, MBEDTLS_RSA_PUBLIC, &molen, signedSecureHeader, decodedSecureHeader, rawHeader.signedSecureHeaderSize);
+							if (orc != 0) {
+								causedException = exception::IntegrityException();
+								break;
+							}
+						}
+#endif
 
 						memcpy(&secureHeader, decodedSecureHeader, sizeof(secureHeader));
-					} else {
+					}
+					else {
 						break;
 					}
-#else
-					break;
-#endif
 
 					if (memcmp(secureHeader.sig, SIGNATURE, sizeof(SIGNATURE)) || secureHeader.sig[15] != rawHeader.version)
 					{
@@ -426,12 +653,14 @@ namespace signedsecurefile {
 					getMemoryAllocator()->release(tempSecretKey);
 				if (decodedSecureHeader)
 					getMemoryAllocator()->release(decodedSecureHeader);
+#if defined(HAS_OPENSSL) && HAS_OPENSSL
 				if (ecsig)
 					ECDSA_SIG_free(ecsig);
 				if (ecPrivateKey)
 					EC_KEY_free(ecPrivateKey);
 				if (ecPrivateGroup)
 					EC_GROUP_free(ecPrivateGroup);
+#endif
 				getMemoryAllocator()->release(signedSecureHeader);
 				if (!result)
 				{

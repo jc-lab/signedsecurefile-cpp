@@ -15,6 +15,11 @@
 #include <openssl/opensslv.h>
 #include <openssl/err.h>
 #endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+#include <mbedtls/md.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/cipher.h>
+#endif
 
 namespace signedsecurefile {
 
@@ -53,6 +58,15 @@ namespace signedsecurefile {
 		HMAC_Init_ex(dataKeyHmacCtx, secretKey.c_str(), secretKey.length(), EVP_sha256(), NULL);
 		dataEvpCtx = NULL;
 #endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+		mbedtls_md_init(&mbed_dataHmacCtx);
+		mbedtls_md_init(&mbed_dataKeyHmacCtx);
+		mbedtls_cipher_init(&mbed_dataCipher);
+		mbedtls_md_setup(&mbed_dataHmacCtx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+		mbedtls_md_setup(&mbed_dataKeyHmacCtx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+		mbedtls_md_hmac_starts(&mbed_dataHmacCtx, (const unsigned char*)secretKey.c_str(), secretKey.length());
+		mbedtls_md_hmac_starts(&mbed_dataKeyHmacCtx, (const unsigned char*)secretKey.c_str(), secretKey.length());
+#endif
 		this->headerReaded = false;
 		this->header.setAsymKey(pubKey);
 	}
@@ -67,10 +81,16 @@ namespace signedsecurefile {
 		if (dataEvpCtx)
 			EVP_CIPHER_CTX_free(dataEvpCtx);
 #endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+		mbedtls_md_free(&mbed_dataHmacCtx);
+		mbedtls_md_free(&mbed_dataKeyHmacCtx);
+		mbedtls_cipher_free(&mbed_dataCipher);
+#endif
 	}
 
 	int InputStream::input(const unsigned char *payload, size_t size, exception::SignedSecureFileException *exception)
 	{
+		Key *key = this->header.getAsymKey();
 		int rc;
 		unsigned char decryptDataBuffer[128 + 32];
 		if (!headerReaded)
@@ -84,73 +104,136 @@ namespace signedsecurefile {
 				unsigned int dataKeyLen = sizeof(dateKey);
 				headerReaded = true;
 #if defined(HAS_OPENSSL) && HAS_OPENSSL
-				int orc;
-				DataCipherAlgorithm dataCipherAlgo = header.getDataCipherAlgorithm();
-				dataEvpCtx = EVP_CIPHER_CTX_new();
+				if (key->isOpensslKey()) {
+					int orc;
+					DataCipherAlgorithm dataCipherAlgo = header.getDataCipherAlgorithm();
+					dataEvpCtx = EVP_CIPHER_CTX_new();
 
-				HMAC_Update(dataKeyHmacCtx, header.secureHeader.key, sizeof(header.secureHeader.key));
-				HMAC_Final(dataKeyHmacCtx, dateKey, &dataKeyLen);
-				HMAC_CTX_reset(dataKeyHmacCtx);
+					HMAC_Update(dataKeyHmacCtx, header.secureHeader.key, sizeof(header.secureHeader.key));
+					HMAC_Final(dataKeyHmacCtx, dateKey, &dataKeyLen);
+					HMAC_CTX_reset(dataKeyHmacCtx);
 
-				if (dataCipherAlgo == DataCipherAlgorithm::AES) {
-					EVP_CipherInit_ex(dataEvpCtx, EVP_aes_256_cbc(), NULL, NULL, NULL, 0);
-					if ((EVP_CIPHER_CTX_key_length(dataEvpCtx) != 32) || (EVP_CIPHER_CTX_iv_length(dataEvpCtx) != 16))
-					{
-						return -1;
+					if (dataCipherAlgo == DataCipherAlgorithm::AES) {
+						EVP_CipherInit_ex(dataEvpCtx, EVP_aes_256_cbc(), NULL, NULL, NULL, 0);
+						if ((EVP_CIPHER_CTX_key_length(dataEvpCtx) != 32) || (EVP_CIPHER_CTX_iv_length(dataEvpCtx) != 16))
+						{
+							return -1;
+						}
+					}
+
+					EVP_CipherInit_ex(dataEvpCtx, NULL, NULL, dateKey, Header::DATA_IV, 0);
+					if (datasize) {
+						size_t remaining = datasize;
+						int outlen;
+						do {
+							unsigned int writtenSize = remaining > 128 ? 128 : remaining;
+							const unsigned char *ptr = buffer.readBuffer(writtenSize);
+							outlen = 0;
+							orc = EVP_CipherUpdate(dataEvpCtx, decryptDataBuffer, &outlen, ptr, writtenSize);
+							if (orc <= 0) {
+								break;
+							}
+							if (outlen > 0) {
+								decryptedDataBuffer.write(decryptDataBuffer, outlen);
+								HMAC_Update(dataHmacCtx, decryptDataBuffer, outlen);
+							}
+							remaining -= writtenSize;
+							datasize = 0;
+						} while (remaining > 0);
 					}
 				}
+#endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+				if (key->isMbedtlsKey()) {
+					int orc;
+					DataCipherAlgorithm dataCipherAlgo = header.getDataCipherAlgorithm();
 
-				EVP_CipherInit_ex(dataEvpCtx, NULL, NULL, dateKey, Header::DATA_IV, 0);
-				if (datasize) {
-					size_t remaining = datasize;
-					int outlen;
-					do {
-						unsigned int writtenSize = remaining > 128 ? 128 : remaining;
-						const unsigned char *ptr = buffer.readBuffer(writtenSize);
-						outlen = 0;
-						orc = EVP_CipherUpdate(dataEvpCtx, decryptDataBuffer, &outlen, ptr, writtenSize);
-						if (orc <= 0) {
-							break;
-						}
-						if (outlen > 0) {
-							decryptedDataBuffer.write(decryptDataBuffer, outlen);
-							HMAC_Update(dataHmacCtx, decryptDataBuffer, outlen);
-						}
-						remaining -= writtenSize;
-						datasize = 0;
-					} while (remaining > 0);
+					mbedtls_md_hmac_update(&mbed_dataKeyHmacCtx, header.secureHeader.key, sizeof(header.secureHeader.key));
+					mbedtls_md_hmac_finish(&mbed_dataKeyHmacCtx, dateKey);
+					mbedtls_md_hmac_reset(&mbed_dataKeyHmacCtx);
+
+					if (dataCipherAlgo == DataCipherAlgorithm::AES) {
+						mbedtls_cipher_setup(&mbed_dataCipher, mbedtls_cipher_info_from_type(MBEDTLS_CIPHER_AES_256_CBC));
+						mbedtls_cipher_setkey(&mbed_dataCipher, dateKey, 256, MBEDTLS_DECRYPT);
+						mbedtls_cipher_set_iv(&mbed_dataCipher, Header::DATA_IV, sizeof(Header::DATA_IV));
+					}
+
+					if (datasize) {
+						size_t remaining = datasize;
+						size_t outlen;
+						do {
+							unsigned int writtenSize = remaining > 128 ? 128 : remaining;
+							const unsigned char *ptr = buffer.readBuffer(writtenSize);
+							outlen = 0;
+							orc = mbedtls_cipher_update(&mbed_dataCipher, ptr, writtenSize, decryptDataBuffer, &outlen);
+							if (orc != 0) {
+								break;
+							}
+							if (outlen > 0) {
+								decryptedDataBuffer.write(decryptDataBuffer, outlen);
+								mbedtls_md_hmac_update(&mbed_dataHmacCtx, decryptDataBuffer, outlen);
+							}
+							remaining -= writtenSize;
+							datasize = 0;
+						} while (remaining > 0);
+					}
 				}
 #endif
 			} else if(rc < 0) {
 				return rc;
 			}
 		} else {
-			int outlen;
 			size_t remaining = size;
-			do {
-				unsigned int writtenSize = remaining > 128 ? 128 : remaining;
-				const unsigned char *ptr = payload;
-				int rc;
-				outlen = 0;
-				rc = EVP_CipherUpdate(dataEvpCtx, decryptDataBuffer, &outlen, ptr, writtenSize);
-				if (rc <= 0) {
-					break;
-				}
-				if (outlen > 0) {
-					decryptedDataBuffer.write(decryptDataBuffer, outlen);
-					HMAC_Update(dataHmacCtx, decryptDataBuffer, outlen);
-				}
-				payload += writtenSize;
-				remaining = writtenSize;
-			} while (remaining > 0);
+#if defined(HAS_OPENSSL) && HAS_OPENSSL
+			if (key->isOpensslKey()) {
+				int outlen;
+				do {
+					unsigned int writtenSize = remaining > 128 ? 128 : remaining;
+					const unsigned char *ptr = payload;
+					int orc;
+					outlen = 0;
+					rc = EVP_CipherUpdate(dataEvpCtx, decryptDataBuffer, &outlen, ptr, writtenSize);
+					if (rc <= 0) {
+						break;
+					}
+					if (outlen > 0) {
+						decryptedDataBuffer.write(decryptDataBuffer, outlen);
+						HMAC_Update(dataHmacCtx, decryptDataBuffer, outlen);
+					}
+					payload += writtenSize;
+					remaining = writtenSize;
+				} while (remaining > 0);
+			}
+#endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+			if (key->isMbedtlsKey()) {
+				size_t outlen;
+				do {
+					unsigned int writtenSize = remaining > 128 ? 128 : remaining;
+					const unsigned char *ptr = payload;
+					int orc;
+					outlen = 0;
+					rc = mbedtls_cipher_update(&mbed_dataCipher, ptr, writtenSize, decryptDataBuffer, &outlen);
+					if (rc != 0) {
+						break;
+					}
+					if (outlen > 0) {
+						decryptedDataBuffer.write(decryptDataBuffer, outlen);
+						mbedtls_md_hmac_update(&mbed_dataHmacCtx, decryptDataBuffer, outlen);
+					}
+					payload += writtenSize;
+					remaining = writtenSize;
+				} while (remaining > 0);
+			}
+#endif
 		}
 		return rc;
 	}
 
 	int InputStream::done(exception::SignedSecureFileException *exception)
 	{
+		Key *key = this->header.getAsymKey();
 		exception::SignedSecureFileException causedException;
-		int outlen;
 		unsigned char computedHmac[32] = {0};
 		unsigned int hmacLen = 32;
 		int orc;
@@ -158,7 +241,9 @@ namespace signedsecurefile {
 		if (!headerReaded)
 			return -1;
 
-		{
+#if defined(HAS_OPENSSL) && HAS_OPENSSL
+		if (key->isOpensslKey()) {
+			int outlen;
 			unsigned char decryptDataBuffer[1024];
 			outlen = sizeof(decryptDataBuffer);
 			ERR_clear_error();
@@ -179,8 +264,31 @@ namespace signedsecurefile {
 				decryptedDataBuffer.write(decryptDataBuffer, outlen);
 				HMAC_Update(dataHmacCtx, decryptDataBuffer, outlen);
 			}
+			HMAC_Final(dataHmacCtx, computedHmac, &hmacLen);
 		}
-		HMAC_Final(dataHmacCtx, computedHmac, &hmacLen);
+#endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+		if (key->isMbedtlsKey()) {
+			size_t outlen;
+			unsigned char decryptDataBuffer[1024];
+			outlen = sizeof(decryptDataBuffer);
+			orc = mbedtls_cipher_finish(&mbed_dataCipher, decryptDataBuffer, &outlen);
+			if (orc != 0)
+			{
+				causedException = exception::IntegrityException();
+				if (exception)
+					*exception = causedException;
+				if (this->useCppThrow)
+					throw causedException;
+				return 0;
+			}
+			if (outlen > 0) {
+				decryptedDataBuffer.write(decryptDataBuffer, outlen);
+				mbedtls_md_hmac_update(&mbed_dataHmacCtx, decryptDataBuffer, outlen);
+			}
+			mbedtls_md_hmac_finish(&mbed_dataHmacCtx, computedHmac);
+		}
+#endif
 
 		if (decryptedDataBuffer.position() < header.secureHeader.datasize)
 		{

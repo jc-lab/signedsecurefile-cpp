@@ -19,6 +19,10 @@
 #include <openssl/hmac.h>
 #include <openssl/aes.h>
 #endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+#include <mbedtls/cipher.h>
+#include <openssl/aes.h>
+#endif
 
 namespace signedsecurefile {
 
@@ -29,6 +33,11 @@ namespace signedsecurefile {
 		HMAC_CTX *dataHmacCtx;
 		HMAC_CTX *dataKeyHmacCtx;
 		EVP_CIPHER_CTX *dataEvpCtx;
+#endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+		mbedtls_md_context_t mbed_dataHmacCtx;
+		mbedtls_md_context_t mbed_dataKeyHmacCtx;
+		mbedtls_cipher_context_t mbed_dataCipher;
 #endif
 
 		bool useCppThrow;

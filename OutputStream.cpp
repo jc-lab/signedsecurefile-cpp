@@ -59,6 +59,12 @@ namespace signedsecurefile {
 		dataEvpCtx = EVP_CIPHER_CTX_new();
 		EVP_CipherInit_ex(dataEvpCtx, EVP_aes_256_cbc(), NULL, dataKey, Header::DATA_IV, 1);
 #endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+		mbedtls_md_init(&mbed_dataHmacCtx);
+		mbedtls_cipher_init(&mbed_dataCipher);
+		mbedtls_md_setup(&mbed_dataHmacCtx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+		mbedtls_md_hmac_starts(&mbed_dataHmacCtx, (const unsigned char*)secretKey.c_str(), secretKey.length());
+#endif
 		this->computedHeaderSize = Header::COMMON_HEADER_SIZE + header.getSignedSecureHeaderSize();
 		this->buffer.writeZero(this->computedHeaderSize);
 	}
@@ -75,46 +81,93 @@ namespace signedsecurefile {
 
 	int OutputStream::write(const unsigned char *buffer, size_t size)
 	{
+		Key *asymKey = this->header.getAsymKey();
 		const unsigned char *writePtr = buffer;
 		size_t remaining = size;
-		int outLen;
-		HMAC_Update(dataHmacCtx, buffer, size);
-		this->header.secureHeader.datasize += size;
-		do {
-			int rc;
-			unsigned char out[256 + 32];
-			unsigned int writtenSize = remaining > 256 ? 256 : remaining;
-			outLen = 0;
-			rc = EVP_CipherUpdate(dataEvpCtx, out, &outLen, writePtr, writtenSize);
-			if (rc <= 0)
-			{
-				// Error
-				break;
-			}
-			remaining -= writtenSize;
-			writePtr += writtenSize;
+#if defined(HAS_OPENSSL) && HAS_OPENSSL
+		if (asymKey->isOpensslKey()) {
+			int outLen;
+			HMAC_Update(dataHmacCtx, buffer, size);
+			this->header.secureHeader.datasize += size;
+			do {
+				int rc;
+				unsigned char out[256 + 32];
+				unsigned int writtenSize = remaining > 256 ? 256 : remaining;
+				outLen = 0;
+				rc = EVP_CipherUpdate(dataEvpCtx, out, &outLen, writePtr, writtenSize);
+				if (rc <= 0)
+				{
+					// Error
+					break;
+				}
+				remaining -= writtenSize;
+				writePtr += writtenSize;
 
-			if(outLen > 0)
-				this->buffer.write(out, outLen);
-		} while (remaining > 0);
+				if (outLen > 0)
+					this->buffer.write(out, outLen);
+			} while (remaining > 0);
+		}
+#endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+		if (asymKey->isMbedtlsKey()) {
+			size_t outLen;
+			mbedtls_md_hmac_update(&mbed_dataHmacCtx, buffer, size);
+			this->header.secureHeader.datasize += size;
+			do {
+				int rc;
+				unsigned char out[256 + 32];
+				unsigned int writtenSize = remaining > 256 ? 256 : remaining;
+				outLen = 0;
+				rc = mbedtls_cipher_update(&mbed_dataCipher, writePtr, writtenSize, out, &outLen);
+				if (rc != 0)
+				{
+					// Error
+					break;
+				}
+				remaining -= writtenSize;
+				writePtr += writtenSize;
+
+				if (outLen > 0)
+					this->buffer.write(out, outLen);
+			} while (remaining > 0);
+		}
+#endif
 		return size;
 	}
 
 	int OutputStream::save(exception::SignedSecureFileException *exception)
 	{
+		Key *asymKey = this->header.getAsymKey();
 		unsigned char hmac[32];
 		unsigned int hmacLen = sizeof(hmac);
-		int outLen;
 		int rc;
 		unsigned char out[256];
-		outLen = sizeof(out);
-		rc = EVP_CipherFinal(dataEvpCtx, out, &outLen);
-		if (rc > 0)
-		{
-			if (outLen > 0)
-				this->buffer.write(out, outLen);
+#if defined(HAS_OPENSSL) && HAS_OPENSSL
+		if (asymKey->isOpensslKey()) {
+			int outLen;
+			outLen = sizeof(out);
+			rc = EVP_CipherFinal(dataEvpCtx, out, &outLen);
+			if (rc > 0)
+			{
+				if (outLen > 0)
+					this->buffer.write(out, outLen);
+			}
+			HMAC_Final(dataHmacCtx, hmac, &hmacLen);
 		}
-		HMAC_Final(dataHmacCtx, hmac, &hmacLen);
+#endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+		if (asymKey->isMbedtlsKey()) {
+			size_t outLen;
+			outLen = sizeof(out);
+			rc = mbedtls_cipher_finish(&mbed_dataCipher, out, &outLen);
+			if (rc > 0)
+			{
+				if (outLen > 0)
+					this->buffer.write(out, outLen);
+			}
+			mbedtls_md_hmac_finish(&mbed_dataHmacCtx, hmac);
+		}
+#endif
 		memcpy(header.secureHeader.hmac, hmac, hmacLen);
 		if (header.writeTo(this->buffer, this->computedHeaderSize, exception))
 		{

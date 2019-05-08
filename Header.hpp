@@ -19,6 +19,10 @@
 #if defined(HAS_OPENSSL) && HAS_OPENSSL
 #include <openssl/ec.h>
 #endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#endif
 
 namespace signedsecurefile {
 
@@ -117,6 +121,10 @@ namespace signedsecurefile {
 #if defined(HAS_OPENSSL) && HAS_OPENSSL
 		EC_KEY *ecLocalPrivateKey;
 #endif
+#if defined(HAS_MBEDTLS) && HAS_MBEDTLS
+		mbedtls_entropy_context entropy_ctx;
+		mbedtls_ctr_drbg_context ctr_drbg_ctx;
+#endif
 
 		ECSignedSecureHeader_t *ecSignedSecureHeader;
 		size_t outputSignedSecureHeaderTotalSize;
@@ -139,6 +147,7 @@ namespace signedsecurefile {
 		Header(const AbstructSignedSecureFile *parent);
 		virtual ~Header();
 		void setAsymKey(Key *key, bool encMode = false);
+		Key *getAsymKey() const { return asymKey; }
 
 		void initHeader();
 		void generateKey();
